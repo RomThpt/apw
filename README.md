@@ -140,6 +140,27 @@ Commands:
 
 <!-- CONTRIBUTING -->
 
+## Chrome approval handoff
+
+The local approval tool shows the HTTPS origin and account in a native Touch ID prompt. On approval, it opens that
+origin in Google Chrome. Select the intended account using Apple's official iCloud Passwords extension and complete the
+sign-in in that tab. The tool reports `browser_opened` when Chrome accepts the URL. It cannot verify authentication or
+whether the selected account matches the prompt.
+
+Build the macOS helper and register the optional local stdio tool from the checkout root:
+
+```sh
+apw_checkout="$PWD"
+swift build --package-path "$apw_checkout/prototypes/signin-approval"
+apw_helper="$(swift build --package-path "$apw_checkout/prototypes/signin-approval" --show-bin-path)/signin-approval-harness"
+codex mcp add apw-approval -- "$(command -v deno)" run --no-prompt "--allow-run=$apw_helper" \
+  "$apw_checkout/src/approval_mcp.ts" "$apw_helper"
+```
+
+Use `open_approved_chrome_tab` with an exact HTTPS origin and an account to display. After signing in, share that Chrome
+tab with the desktop app to continue. This path opens Chrome without running the regular `apw` daemon. Chrome and the
+official extension handle the credentials directly.
+
 ## Building
 
 This project uses Deno for development and compilation. Make sure you have Deno installed on your system before
