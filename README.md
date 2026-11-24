@@ -169,6 +169,8 @@ official extension handle the credentials directly.
 
 ## Building
 
+Use Deno 2.7 or newer for the daemon's nonblocking file lock. Stop a running older daemon before updating.
+
 This project uses Deno for development and compilation. Make sure you have Deno installed on your system before
 proceeding.
 
