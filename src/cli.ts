@@ -1,6 +1,7 @@
 import { Command, Input, Secret, Select } from "./deps.ts";
 import { daemon } from "./daemon.ts";
 import { ApplePasswordManager } from "./client.ts";
+import { readExactText } from "./transport.ts";
 import { BROWSERS, installedBrowsers } from "./browser.ts";
 import { readConfig, writeConfig } from "./config.ts";
 import { APWError, Status, VERSION } from "./const.ts";
@@ -9,6 +10,12 @@ import type { PasswordEntry, Payload } from "./types.ts";
 const client = new ApplePasswordManager();
 
 const printSuccess = () => console.log(JSON.stringify({ status: Status.SUCCESS }));
+
+async function readStdinPassword(): Promise<string> {
+  const password = await readExactText(Deno.stdin);
+  if (!password) throw new APWError(Status.INVALID_PARAM, "Password is required");
+  return password;
+}
 
 function printResult(payload: Payload, table: boolean): void {
   const entries = payload.Entries.map((entry) => {
@@ -120,11 +127,15 @@ const pw = new Command()
     printResult(await client.getLoginNamesForURL(url), !!table && !json);
   })
   .command("save", "Create or update a password.")
-  .option("--stdin", "Read password from stdin instead of prompting.")
+  .option(
+    "--stdin",
+    "Read the password from stdin exactly as supplied. Nothing is trimmed, including spaces and a final newline, " +
+      "so pipe it without one (e.g. printf '%s').",
+  )
   .arguments("<url:string> <username:string>")
   .action(async (options: { stdin?: boolean }, url: string, username: string) => {
     const pwd = options.stdin
-      ? (await new Response(Deno.stdin.readable).text()).trim()
+      ? await readStdinPassword()
       : await Secret.prompt({ message: "Enter password: ", minLength: 1 });
     await client.saveAccountForURL(url, username, pwd);
     printSuccess();
@@ -166,8 +177,9 @@ const auth = new Command()
   .description("Authenticate CLI with daemon.")
   .action(async () => {
     await client.requestChallenge();
-    const pin = await Input.prompt({
+    const pin = await Secret.prompt({
       message: "Enter PIN: ",
+      label: "PIN",
       minLength: 6,
       maxLength: 6,
     });
