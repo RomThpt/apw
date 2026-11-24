@@ -27,7 +27,10 @@ jobs:
         run: deno lint
 
       - name: Verify types
-        run: deno check src/cli.ts
+        run: deno check src/cli.ts src/approval_mcp.ts
+
+      - name: Run Deno tests
+        run: deno test --frozen --allow-env=HOME src/
 
       - name: Build
         run: |
@@ -40,3 +43,17 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: dist/*
+
+  approval-swift:
+    # Runs the core unit tests, which use a fake approver. The harness executable is never launched, so no Touch ID
+    # prompt or browser is involved.
+    runs-on: macos-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Test approval core
+        run: swift test --package-path prototypes/signin-approval
