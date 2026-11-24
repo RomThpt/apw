@@ -23,3 +23,8 @@ helper and returns `browser_opened` or `browser_unavailable` in addition to the 
 completes sign-in in Chrome. The tool never reads credentials and never connects to the regular daemon. An automated
 credential consumer must verify the actual tab origin and the selected account inside a component isolated from the
 requester.
+
+The stdio tool honors `notifications/cancelled` for the in-flight call when `requestId` matches its ID exactly, with
+string and numeric IDs kept distinct. Cancellation and stdin EOF stop the native helper and suppress the reply. A new
+call is refused until the helper has exited. A helper that times out after 45 seconds is stopped and reported as
+`unavailable`. Stopping the helper cannot undo a Chrome handoff that macOS has already accepted.
