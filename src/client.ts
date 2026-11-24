@@ -1,19 +1,13 @@
 import { Action, APWError, Command, SOCKET_PATH, Status } from "./const.ts";
 import type { APWResponse, DecryptedData, Message, PasswordEntry, Payload, TOTPEntry } from "./types.ts";
+import { confirmPairing } from "./pairing.ts";
+import { readLine, writeAll } from "./transport.ts";
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
 
-async function readLine(conn: Deno.Conn): Promise<string> {
-  const buf = new Uint8Array(64 * 1024);
-  let text = "";
-  while (!text.includes("\n")) {
-    const n = await conn.read(buf);
-    if (n === null) break;
-    text += decoder.decode(buf.subarray(0, n));
-  }
-  return text.split("\n", 1)[0];
-}
+// Slightly longer than the daemon's own 30 s extension timeout so its error reply arrives first.
+const REQUEST_TIMEOUT_MS = 35_000;
+const STATUS_TIMEOUT_MS = 3_000;
 
 export const APWMessages = {
   getLoginNamesForURL(url: string): Message {
@@ -101,7 +95,7 @@ export function entriesFrom(data: DecryptedData): unknown[] {
 }
 
 export class ApplePasswordManager {
-  private async sendMessage(message: Message): Promise<APWResponse> {
+  private async sendMessage(message: Message, timeoutMs = REQUEST_TIMEOUT_MS): Promise<APWResponse> {
     let conn: Deno.Conn;
     try {
       conn = await Deno.connect({ transport: "unix", path: SOCKET_PATH });
@@ -109,16 +103,57 @@ export class ApplePasswordManager {
       throw new APWError(Status.INVALID_SESSION);
     }
 
+    let closed = false;
+    let timedOut = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      try {
+        conn.close();
+      } catch { /* already closed */ }
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      close();
+    }, timeoutMs);
+
     try {
-      await conn.write(encoder.encode(`${JSON.stringify(message)}\n`));
-      const response = JSON.parse(await readLine(conn)) as APWResponse;
-      if (!("data" in response) && response.status !== Status.SUCCESS) {
-        throw new APWError(response.status, response.error);
+      let line: string;
+      try {
+        await writeAll(conn, encoder.encode(`${JSON.stringify(message)}\n`));
+        line = await readLine(conn);
+      } catch (error) {
+        if (timedOut) throw new APWError(Status.SERVER_ERROR, "Timed out waiting for the daemon");
+        if (error instanceof APWError) throw error;
+        throw new APWError(Status.INVALID_SESSION, "Lost connection to the daemon");
       }
-      return response;
+
+      let response: unknown;
+      try {
+        response = JSON.parse(line);
+      } catch {
+        throw new APWError(Status.SERVER_ERROR, "Malformed response from daemon");
+      }
+      if (!response || typeof response !== "object") throw new APWError(Status.SERVER_ERROR);
+      if (!("data" in response)) {
+        const { status, error } = response as { status?: unknown; error?: unknown };
+        if (typeof status !== "number") throw new APWError(Status.SERVER_ERROR);
+        if (status !== Status.SUCCESS) {
+          throw new APWError(status as Status, typeof error === "string" ? error : undefined);
+        }
+      }
+      return response as APWResponse;
     } finally {
-      conn.close();
+      clearTimeout(timer);
+      close();
     }
+  }
+
+  /** HANDSHAKE replies never carry data; anything else is a protocol error. */
+  private async handshake(message: Extract<Message, { cmd: Command.HANDSHAKE }>, timeoutMs?: number) {
+    const response = await this.sendMessage(message, timeoutMs);
+    if ("data" in response) throw new APWError(Status.SERVER_ERROR);
+    return response;
   }
 
   private async getPayload(message: Message): Promise<Payload> {
@@ -143,11 +178,20 @@ export class ApplePasswordManager {
   }
 
   async requestChallenge(): Promise<void> {
-    await this.sendMessage({ cmd: Command.HANDSHAKE });
+    await this.handshake({ cmd: Command.HANDSHAKE });
   }
 
+  /**
+   * Submits the PIN, then resolves only once the extension reports an established session. Rejects with
+   * `INVALID_SESSION` if pairing is not confirmed within a short bounded window.
+   */
   async verifyChallenge(pin: string): Promise<void> {
-    await this.sendMessage({ cmd: Command.HANDSHAKE, pin });
+    if (typeof pin !== "string" || !pin) throw new APWError(Status.INVALID_PARAM, "PIN is required");
+    const submission = await this.handshake({ cmd: Command.HANDSHAKE, pin });
+    // The status query is only sent when the submission reply proves the bridge understands it; an older bridge
+    // would treat a HANDSHAKE without a PIN as a new challenge and discard the pairing in progress.
+    const query = () => this.handshake({ cmd: Command.HANDSHAKE, status: true }, STATUS_TIMEOUT_MS);
+    await confirmPairing(submission, query);
   }
 
   getLoginNamesForURL(url: string): Promise<Payload> {

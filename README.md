@@ -120,6 +120,12 @@ Retrieve a one-time code:
 
 `apw otp get google.com`
 
+`apw pw save --stdin` preserves the input exactly, including spaces and newlines. Use `printf '%s'` when piping a
+password without a final newline. In an interactive terminal, the default prompt masks the input.
+
+After updating, restart the running daemon before pairing again. `apw auth` reports success once the extension confirms
+the session is paired.
+
 View more commands & help:
 
 `apw --help`

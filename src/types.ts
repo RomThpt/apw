@@ -2,6 +2,8 @@ import { Command, Status } from "./const.ts";
 
 export type Message =
   | { cmd: Command.HANDSHAKE; pin?: string }
+  // Read-only pairing status query; the bridge answers without starting or advancing a challenge.
+  | { cmd: Command.HANDSHAKE; status: true }
   | {
     cmd: number;
     qid: string;
@@ -15,7 +17,8 @@ export type DecryptedData = { STATUS: number } & Record<string, unknown>;
 
 export type APWResponse =
   | { id: string; data: DecryptedData }
-  | { id: string; status: Status; error?: string };
+  // `paired` is present on HANDSHAKE replies from bridges that support pairing status.
+  | { id: string; status: Status; error?: string; paired?: boolean };
 
 export interface PasswordEntry {
   USR: string;

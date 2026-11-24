@@ -1,16 +1,32 @@
 (function apwBridge() {
   const { port, token } = self.APW_CONFIG;
-  const OK = 0, INVALID_SESSION = 9, SERVER_ERROR = 100;
+  const OK = 0, INVALID_PARAM = 2, INVALID_SESSION = 9, SERVER_ERROR = 100;
   let ws, pending;
   const send = (message) => ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify(message));
   const fail = (id, status, error) => send({ id, status, error: String(error) });
+  const paired = () => typeof g_theState !== "undefined" && g_theState === "SessionKeySet";
+
+  // Every HANDSHAKE reply carries `paired`, which also tells clients that the read-only `status` query is supported.
+  function handshake(message) {
+    const { id } = message;
+    if (message.status !== undefined) {
+      if (message.status !== true || message.pin != null) return fail(id, INVALID_PARAM, "invalid status request");
+      return send({ id, status: OK, paired: paired() });
+    }
+    if (message.pin != null && typeof message.pin !== "string") return fail(id, INVALID_PARAM, "invalid pin");
+    try {
+      // Reply as soon as the challenge step is dispatched, as before; clients confirm the outcome via `status`.
+      const result = message.pin == null ? ChallengePIN() : PINSet(message.pin);
+      if (typeof result?.then === "function") result.then(undefined, () => {});
+    } catch {
+      return fail(id, SERVER_ERROR, "handshake failed");
+    }
+    send({ id, status: OK, paired: paired() });
+  }
 
   function request(message) {
-    if (message.cmd === 2) {
-      message.pin == null ? ChallengePIN() : PINSet(message.pin);
-      return send({ id: message.id, status: OK });
-    }
-    if (g_theState !== "SessionKeySet") return fail(message.id, INVALID_SESSION, "unpaired");
+    if (message.cmd === 2) return handshake(message);
+    if (!paired()) return fail(message.id, INVALID_SESSION, "unpaired");
     pending = { id: message.id, cmd: message.cmd };
     try {
       const SMSG = g_secretSession.createSMSG(JSON.stringify(message.body));
@@ -49,7 +65,15 @@
       pending = null;
       setTimeout(connect, 3000);
     };
-    ws.onmessage = ({ data }) => request(JSON.parse(data));
+    ws.onmessage = ({ data }) => {
+      let message;
+      try {
+        message = JSON.parse(data);
+      } catch {
+        return;
+      }
+      if (message && typeof message === "object") request(message);
+    };
   }
   if (!g_nativeAppPort) connectToBackgroundNativeAppAndSetUpListeners();
   g_nativeAppPort?.onMessage?.addListener(reply);
