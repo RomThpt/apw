@@ -1,6 +1,15 @@
 import bridgeSource from "../ext/bridge.js" with { type: "text" };
 import { writeConfig } from "./config.ts";
 import { APWError, BROWSER_PROFILE_PATH, EXTENSION_PATH, Status } from "./const.ts";
+import { findExtensionSource, missingExtensionMessage } from "./browser_profiles.ts";
+import {
+  awaitPipeResponse,
+  drainPipe,
+  encodePipeCommand,
+  PIPE_SHELL,
+  pipeResponseError,
+  pipeShellArgs,
+} from "./devtools_pipe.ts";
 
 const HOME = Deno.env.get("HOME")!;
 const APPLE_MANIFEST = "/Library/Google/Chrome/NativeMessagingHosts/com.apple.passwordmanager.json";
@@ -43,11 +52,21 @@ function exists(path: string): boolean {
   }
 }
 
-function directories(path: string): string[] {
+function isFile(path: string): boolean {
+  try {
+    return Deno.statSync(path).isFile;
+  } catch {
+    return false;
+  }
+}
+
+/** Directory names under `path`; `[]` if it does not exist, `null` if access is denied. */
+function directories(path: string): string[] | null {
   try {
     return [...Deno.readDirSync(path)].filter((entry) => entry.isDirectory).map((entry) => entry.name);
   } catch (error) {
     if (error instanceof Deno.errors.NotFound) return [];
+    if (error instanceof Deno.errors.PermissionDenied) return null;
     throw error;
   }
 }
@@ -73,30 +92,18 @@ function copyDirectory(source: string, target: string): void {
   }
 }
 
-function extensionSource(): string | undefined {
-  for (const { dataPath } of BROWSERS) {
-    for (const profile of directories(dataPath)) {
-      const base = `${dataPath}/${profile}/Extensions/${EXTENSION_ID}`;
-      const version = directories(base).sort((a, b) => a.localeCompare(b, undefined, { numeric: true })).at(-1);
-      if (!version) continue;
-      const path = `${base}/${version}`;
-      if (exists(`${path}/${BACKGROUND}`)) return path;
-    }
-  }
-}
-
 function buildExtension(config: { port: number; token: string }): void {
   const background = `${EXTENSION_PATH}/${BACKGROUND}`;
   const orig = `${background}.orig`;
 
   if (!exists(orig)) {
-    const source = extensionSource();
-    if (!source) {
-      throw new APWError(
-        Status.GENERIC_ERROR,
-        "Apple Passwords extension not found. Install it from the Chrome Web Store.",
-      );
-    }
+    const { path: source, inaccessible } = findExtensionSource(
+      BROWSERS.map(({ dataPath }) => dataPath),
+      EXTENSION_ID,
+      BACKGROUND,
+      { directories, isFile },
+    );
+    if (!source) throw new APWError(Status.GENERIC_ERROR, missingExtensionMessage(inaccessible));
     remove(EXTENSION_PATH);
     Deno.mkdirSync(EXTENSION_PATH, { recursive: true });
     copyDirectory(source, EXTENSION_PATH);
@@ -115,42 +122,17 @@ export function installedBrowsers(): Browser[] {
   return BROWSERS.filter(({ bin }) => exists(bin));
 }
 
-async function debuggerUrl(port: number): Promise<string> {
-  const endpoint = `http://127.0.0.1:${port}/json/version`;
-  for (let attempt = 0; attempt < 60; attempt++) {
-    const data = await fetch(endpoint).then((response) => response.json()).catch(() => ({}));
-    if (data.webSocketDebuggerUrl) return data.webSocketDebuggerUrl;
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  throw new Error("Browser DevTools endpoint did not start");
-}
+const STARTUP_TIMEOUT_MS = 30_000;
+const LOAD_EXTENSION_ID = 1;
 
-async function loadExtension(port: number): Promise<void> {
-  const socket = new WebSocket(await debuggerUrl(port));
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("Extensions.loadUnpacked timed out")), 15_000);
-      const finish = (error?: Error) => {
-        clearTimeout(timer);
-        error ? reject(error) : resolve();
-      };
-      socket.onerror = () => finish(new Error("DevTools connection failed"));
-      socket.onopen = () =>
-        socket.send(JSON.stringify({
-          id: 1,
-          method: "Extensions.loadUnpacked",
-          params: { path: EXTENSION_PATH },
-        }));
-      socket.onmessage = (event) => {
-        const message = JSON.parse(event.data as string);
-        if (message.id === 1) finish(message.error && new Error(message.error.message));
-      };
-    });
-  } finally {
-    socket.close();
-  }
-}
+// Pipe write ends of running browsers, held so they stay open until the browser exits.
+const openPipes = new Set<WritableStreamDefaultWriter<Uint8Array>>();
 
+/**
+ * Launches the browser with DevTools available only over a private pipe (no TCP port) and loads
+ * the bridge extension through it. The pipe's write end stays open for the browser's lifetime and
+ * its output keeps being drained; the browser shuts down when the daemon exits and the pipe closes.
+ */
 export async function launchBrowser(
   browser: Browser,
   config: { port: number; token: string },
@@ -161,28 +143,50 @@ export async function launchBrowser(
   Deno.mkdirSync(hosts, { recursive: true });
   Deno.copyFileSync(APPLE_MANIFEST, `${hosts}/com.apple.passwordmanager.json`);
 
-  const port = 9500 + Math.floor(Math.random() * 400);
-  const child = new Deno.Command(browser.bin, {
-    args: [
+  const child = new Deno.Command(PIPE_SHELL, {
+    args: pipeShellArgs(browser.bin, [
       `--user-data-dir=${browser.profile}`,
-      `--remote-debugging-port=${port}`,
-      "--remote-allow-origins=*",
+      "--remote-debugging-pipe",
       "--enable-unsafe-extension-debugging",
       "--headless=new",
       "--no-first-run",
       "--no-default-browser-check",
       "--disable-background-timer-throttling",
       "--disable-backgrounding-occluded-windows",
-    ],
-    stdout: "null",
+    ]),
+    stdin: "piped",
+    stdout: "piped",
     stderr: "null",
   }).spawn();
+  const commands = child.stdin.getWriter();
+  const replies = child.stdout.getReader();
 
   try {
-    await loadExtension(port);
-    return child;
+    await commands.write(encodePipeCommand({
+      id: LOAD_EXTENSION_ID,
+      method: "Extensions.loadUnpacked",
+      params: { path: EXTENSION_PATH },
+    })).catch(() => {
+      throw new Error("Browser exited before its DevTools pipe was ready");
+    });
+    const response = await awaitPipeResponse(replies, LOAD_EXTENSION_ID, {
+      timeoutMs: STARTUP_TIMEOUT_MS,
+      exited: child.status,
+    });
+    const error = pipeResponseError(response);
+    if (error) throw new Error(`Could not load extension: ${error}`);
   } catch (error) {
-    child.kill("SIGTERM");
+    replies.cancel().catch(() => {});
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // Already exited.
+    }
     throw error;
   }
+
+  openPipes.add(commands);
+  child.status.finally(() => openPipes.delete(commands));
+  drainPipe(replies);
+  return child;
 }
