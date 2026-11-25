@@ -30,7 +30,7 @@ jobs:
         run: deno check src/cli.ts src/approval_mcp.ts
 
       - name: Run Deno tests
-        run: deno test --frozen --allow-env=HOME src/
+        run: deno test --frozen --allow-env=HOME --allow-read=/tmp --allow-write=/tmp src/
 
       - name: Build
         run: |
