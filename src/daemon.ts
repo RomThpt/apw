@@ -1,5 +1,6 @@
 import { APWError, DATA_PATH, SOCKET_PATH, Status } from "./const.ts";
 import { type Browser, launchBrowser } from "./browser.ts";
+import { stopBrowser } from "./child_shutdown.ts";
 import { acquireSingletonLock, AlreadyRunningError } from "./daemon_lock.ts";
 import { ExtensionSession, SessionUnavailableError } from "./extension_session.ts";
 import { FrameError, isRecord, readLineFrame, writeAll } from "./framing.ts";
@@ -146,13 +147,12 @@ export async function daemon(browser: Browser): Promise<void> {
 
   let stopping = false;
   const shutdown = async () => {
+    if (stopping) return;
     stopping = true;
-    try {
-      child.kill("SIGTERM");
-      await child.status;
-    } catch { /* ignore */ }
+    const stopped = await stopBrowser(child);
+    if (!stopped) console.error("[apw] Could not confirm the browser stopped.");
     daemonLock?.close();
-    Deno.exit(0);
+    Deno.exit(stopped ? 0 : 1);
   };
   for (const signal of ["SIGINT", "SIGTERM"] as const) Deno.addSignalListener(signal, shutdown);
   child.status.then((status) => {

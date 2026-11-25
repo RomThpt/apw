@@ -192,6 +192,28 @@ Deno.test("profile scan reports a clear failure when nothing is found", () => {
   assertEqual(missingExtensionMessage([]).includes("permission"), false, "message without denied folders");
 });
 
+Deno.test("profile scan picks the newest copy within the preferred browser", () => {
+  const old = "/chrome/Profile 1/Extensions/id";
+  const current = "/chrome/Profile 2/Extensions/id";
+  const other = "/brave/Default/Extensions/id";
+  const fs = profileTree({
+    "/chrome": ["Profile 1", "Profile 2"],
+    "/brave": ["Default"],
+    [old]: ["3.9.0_0"],
+    [current]: ["3.10.0_0"],
+    [other]: ["4.0.0_0"],
+  }, [
+    `${old}/3.9.0_0/background.js`,
+    `${current}/3.10.0_0/background.js`,
+    `${other}/4.0.0_0/background.js`,
+  ]);
+  assertEqual(
+    findExtensionSource(["/chrome", "/brave"], "id", "background.js", fs).path,
+    `${current}/3.10.0_0`,
+    "preferred browser",
+  );
+});
+
 // --- Singleton lock ------------------------------------------------------------------------------
 
 interface MockLockFile {

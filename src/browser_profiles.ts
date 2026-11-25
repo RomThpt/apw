@@ -26,14 +26,20 @@ export function findExtensionSource(
   };
 
   for (const dataPath of dataPaths) {
+    let newest: { path: string; version: string } | undefined;
     for (const profile of list(dataPath)) {
       const base = `${dataPath}/${profile}/Extensions/${extensionId}`;
       const versions = list(base).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
       for (const version of versions) {
         const path = `${base}/${version}`;
-        if (fs.isFile(`${path}/${entry}`)) return { path, inaccessible };
+        if (!fs.isFile(`${path}/${entry}`)) continue;
+        if (!newest || version.localeCompare(newest.version, undefined, { numeric: true }) > 0) {
+          newest = { path, version };
+        }
+        break;
       }
     }
+    if (newest) return { path: newest.path, inaccessible };
   }
   return { inaccessible };
 }

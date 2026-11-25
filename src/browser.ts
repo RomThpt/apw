@@ -1,7 +1,9 @@
 import bridgeSource from "../ext/bridge.js" with { type: "text" };
-import { writeConfig } from "./config.ts";
-import { APWError, BROWSER_PROFILE_PATH, EXTENSION_PATH, Status } from "./const.ts";
+import { readConfig, writeConfig } from "./config.ts";
+import { APWError, BROWSER_PROFILE_PATH, DATA_PATH, EXTENSION_PATH, Status } from "./const.ts";
 import { findExtensionSource, missingExtensionMessage } from "./browser_profiles.ts";
+import { refreshExtensionCache, restoreExtensionCache } from "./extension_cache.ts";
+import { stopBrowser } from "./child_shutdown.ts";
 import {
   awaitPipeResponse,
   drainPipe,
@@ -79,37 +81,25 @@ function remove(path: string): void {
   }
 }
 
-function copyDirectory(source: string, target: string): void {
-  Deno.mkdirSync(target, { recursive: true });
-  for (const entry of Deno.readDirSync(source)) {
-    const from = `${source}/${entry.name}`;
-    const to = `${target}/${entry.name}`;
-    if (entry.isDirectory) {
-      copyDirectory(from, to);
-    } else if (entry.isFile) {
-      Deno.copyFileSync(from, to);
-    }
-  }
-}
-
-function buildExtension(config: { port: number; token: string }): void {
+function buildExtension(browser: Browser, config: { port: number; token: string }): void {
   const background = `${EXTENSION_PATH}/${BACKGROUND}`;
   const orig = `${background}.orig`;
-
-  if (!exists(orig)) {
-    const { path: source, inaccessible } = findExtensionSource(
-      BROWSERS.map(({ dataPath }) => dataPath),
-      EXTENSION_ID,
-      BACKGROUND,
-      { directories, isFile },
-    );
-    if (!source) throw new APWError(Status.GENERIC_ERROR, missingExtensionMessage(inaccessible));
-    remove(EXTENSION_PATH);
-    Deno.mkdirSync(EXTENSION_PATH, { recursive: true });
-    copyDirectory(source, EXTENSION_PATH);
-    remove(`${EXTENSION_PATH}/_metadata`);
-    Deno.copyFileSync(background, orig);
+  restoreExtensionCache(EXTENSION_PATH);
+  const { path: source, inaccessible } = findExtensionSource(
+    [browser.dataPath, ...BROWSERS.filter(({ id }) => id !== browser.id).map(({ dataPath }) => dataPath)],
+    EXTENSION_ID,
+    BACKGROUND,
+    { directories, isFile },
+  );
+  const cached = isFile(orig);
+  if (source && (!cached || source !== readConfig()?.extensionPath)) {
+    refreshExtensionCache(source, EXTENSION_PATH, DATA_PATH);
     writeConfig({ extensionVersion: source.split("/").at(-1)!, extensionPath: source });
+  } else if (!source) {
+    if (!cached || !inaccessible.length) {
+      throw new APWError(Status.GENERIC_ERROR, missingExtensionMessage(inaccessible));
+    }
+    console.warn("[apw] Could not check the installed extension. Using the cached copy.");
   }
 
   Deno.writeTextFileSync(
@@ -137,7 +127,7 @@ export async function launchBrowser(
   browser: Browser,
   config: { port: number; token: string },
 ): Promise<Deno.ChildProcess> {
-  buildExtension(config);
+  buildExtension(browser, config);
   remove(browser.profile);
   const hosts = `${browser.profile}/NativeMessagingHosts`;
   Deno.mkdirSync(hosts, { recursive: true });
@@ -176,12 +166,8 @@ export async function launchBrowser(
     const error = pipeResponseError(response);
     if (error) throw new Error(`Could not load extension: ${error}`);
   } catch (error) {
-    replies.cancel().catch(() => {});
-    try {
-      child.kill("SIGTERM");
-    } catch {
-      // Already exited.
-    }
+    void replies.cancel().catch(() => {});
+    if (!await stopBrowser(child)) console.error("[apw] Could not confirm the browser stopped after startup failed.");
     throw error;
   }
 
